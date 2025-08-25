@@ -31,6 +31,7 @@ public class Issue extends BaseEntity {
     private String title;
 
     @Column(name = "estimated_time", length = 30)
+    //백엔드 계산
     private String estimatedTime;  // "1시간 이내", "1-3시간", "3-8시간", "8시간 이상"
 
     @Column(name = "github_url", nullable = false, length = 500)
@@ -40,6 +41,7 @@ public class Issue extends BaseEntity {
     private LocalDateTime createdAt;  // GitHub에서 이슈가 생성된 시간
 
     @Column(name = "difficulty_level", length = 20)
+    //백엔드 계산
     private String difficultyLevel;  // "초급", "중급", "고급"
 
     @Column(name = "popularity_score")

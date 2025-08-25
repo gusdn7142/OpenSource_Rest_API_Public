@@ -1,25 +1,23 @@
 package org.example.opensource_rest_api.controller;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.http.HttpEntity;
-import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpMethod;
+import org.example.opensource_rest_api.entity.Issue;
+import org.example.opensource_rest_api.repository.IssueRepository;
 import org.springframework.http.ResponseEntity;
-import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.web.bind.annotation.*;
-import org.springframework.web.client.RestTemplate;
-//import org.springframework.web.reactive.function.client.WebClient;
 
+import java.util.List;
 import java.util.Map;
 
 @Slf4j
 @RestController
 @RequestMapping("/api/test")
 @CrossOrigin(origins = "*")
+@RequiredArgsConstructor
 public class TestController {
+
+    private final IssueRepository issueRepository;
 
 //    @Value("${github.token:}")
 //    private String githubToken;
@@ -140,4 +138,31 @@ public class TestController {
 //            log.error("JSON 파싱 실패: {}", e.getMessage());
 //        }
 //    }
+
+
+    /**
+     * 수집된 이슈 통계 조회
+     */
+    @GetMapping("/issues/stats")
+    public ResponseEntity<Map<String, Object>> getIssueStats() {
+        try {
+            List<Issue> issues = issueRepository.findAll();
+            long totalCount = issues.size();
+
+            Map<String, Long> byRepository = issues.stream()
+                    .collect(java.util.stream.Collectors.groupingBy(
+                            issue -> issue.getRepository().getOwner() + "/" + issue.getRepository().getName(),
+                            java.util.stream.Collectors.counting()
+                    ));
+
+            return ResponseEntity.ok(Map.of(
+                    "totalCount", totalCount,
+                    "byRepository", byRepository,
+                    "message", "MVP 스케줄러로 수집된 이슈 통계"
+            ));
+        } catch (Exception e) {
+            log.error("이슈 통계 조회 중 오류 발생: {}", e.getMessage());
+            return ResponseEntity.ok(Map.of("error", e.getMessage()));
+        }
+    }
 }

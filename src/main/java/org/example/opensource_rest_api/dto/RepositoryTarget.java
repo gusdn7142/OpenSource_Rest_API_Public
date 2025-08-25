@@ -33,4 +33,27 @@ public class RepositoryTarget {
      * 예: ["good first issue", "status: waiting-for-triage"]
      */
     private List<String> labels;
+    
+    /**
+     * fullName에서 owner 부분을 추출합니다
+     * @return owner 이름 (예: "spring-projects", "facebook")
+     */
+    public String getOwner() {
+        if (fullName == null || !fullName.contains("/")) {
+            return "unknown";
+        }
+        return fullName.split("/")[0];
+    }
+    
+    /**
+     * fullName에서 repository name 부분을 추출합니다
+     * @return repository 이름 (예: "spring-boot", "react")
+     */
+    public String getName() {
+        if (fullName == null || !fullName.contains("/")) {
+            return "unknown";
+        }
+        String[] parts = fullName.split("/");
+        return parts.length > 1 ? parts[1] : "unknown";
+    }
 }
