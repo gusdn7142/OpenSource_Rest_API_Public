@@ -2,11 +2,9 @@ package org.example.opensource_rest_api.service;
 
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.example.opensource_rest_api.config.DifficultyConfig;
 import org.example.opensource_rest_api.config.MVPRepositoryConfig;
-import org.example.opensource_rest_api.dto.GitHubIssue;
-import org.example.opensource_rest_api.dto.GitHubLabel;
-import org.example.opensource_rest_api.dto.GitHubSearchResponse;
-import org.example.opensource_rest_api.dto.RepositoryTarget;
+import org.example.opensource_rest_api.dto.*;
 import org.example.opensource_rest_api.entity.Issue;
 import org.example.opensource_rest_api.entity.Label;
 import org.example.opensource_rest_api.entity.Repository;
@@ -16,59 +14,67 @@ import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.Map;
 
 /**
- * GitHub 이슈 동기화 서비스 (MVP 버전)
- *
- * Phase 1: 코어 5개 저장소에서 초보자용 이슈를 수집하는 서비스입니다.
- * RestTemplate 기반의 직접 API 호출 방식을 사용하여 안정적인 데이터 수집을 제공합니다.
- *
- * 주요 기능:
- * - 2시간마다 자동 실행되는 스케줄링
- * - 레포지토리별 맞춤 라벨 기반 이슈 수집
- * - 중복 이슈 방지 및 데이터 정합성 보장
- * - 트랜잭션 기반 안전한 데이터 처리
+ * GitHub 이슈 수집 서비스
+ * 
+ * 여러 오픈소스 저장소에서 오픈 이슈를 주기적으로 수집합니다.
+ * 전체 이슈 데이터를 수집하여 개발자들이 기여할 수 있는 프로젝트를 찾을 수 있도록 도움니다.
  */
 @Slf4j
 @Service
 @RequiredArgsConstructor
 public class GitHubSyncService {
 
-    // 기존 서비스는 레거시 지원용으로 유지
-//    private final GitHubIssueService githubIssueService;
+    // 동기화 관련 상수
+    private static final Duration SYNC_INTERVAL = Duration.ofHours(4);
+    private static final Duration RATE_LIMIT_DELAY = Duration.ofSeconds(30); // Secondary Rate Limit 대응으로 30초로 증가
+    private static final Duration RETRY_DELAY_AFTER_RATE_LIMIT = Duration.ofMinutes(2); // Rate Limit 후 2분 대기
+    private static final int MAX_PAGES_PER_REPO = 10; // 저장소당 최대 10페이지 (1000개 이슈)
+    private static final int ISSUES_PER_PAGE = 100; // 페이지당 이슈 수 (GitHub API 최대값)
+    
+    // 난이도 관련 상수
+    private static final String DIFFICULTY_BEGINNER = "초급";
+    private static final String DIFFICULTY_INTERMEDIATE = "중급"; 
+    private static final String DIFFICULTY_ADVANCED = "고급";
+    
+    // 인기도 계산 상수
+    private static final int MAX_POPULARITY_SCORE = 100;
+    private static final int MIN_POPULARITY_SCORE = 0;
 
     // MVP용 새로운 서비스들
     private final GitHubDirectApiService githubDirectApiService;
     private final MVPRepositoryConfig mvpRepositoryConfig;
+    private final DifficultyConfig difficultyConfig;
 
     // 데이터 저장소
     private final RepositoryRepository repositoryRepository;
     private final IssueRepository issueRepository;
 
     /**
-     * MVP GitHub 이슈 동기화 - 2시간마다 실행
-     *
-     * Phase 1 코어 5개 저장소에서 초보자 친화적 이슈를 수집합니다.
-     * RestTemplate 기반 동기 방식으로 안정적인 데이터 처리를 보장합니다.
-     *
-     * 수집 대상:
-     * - spring-projects/spring-boot (Java 백엔드)
-     * - elastic/elasticsearch (Java 백엔드)
-     * - facebook/react (JavaScript 프론트엔드)
-     * - vuejs/vue (JavaScript 프론트엔드)
-     * - vercel/next.js (JavaScript 프론트엔드)
-     *
-     * 각 저장소당 최대 20개 이슈, 실제 사용 라벨만 적용
+     * GitHub 이슈 동기화 - 4시간마다 실행
+     * 
+     * 대상 저장소에서 오픈 이슈를 수집하여 데이터베이스에 저장합니다.
+     * 각 저장소에서 최대 1000개의 이슈를 수집합니다.
      */
-    @Scheduled(fixedDelay = 7200000) // 2시간마다 실행 (MVP 최적화)
+    @Scheduled(fixedDelayString = "#{T(java.time.Duration).ofHours(4).toMillis()}") // 4시간마다 실행 (Rate Limit 고려하여 조정)
     public void syncMVPGitHubIssues() {
         log.info("=== MVP GitHub 이슈 동기화 시작 ===");
+
+        // Rate Limit 상태 확인
+        String rateLimitInfo = githubDirectApiService.checkRateLimit();
+        if (rateLimitInfo != null) {
+            log.info("현재 GitHub API Rate Limit 상태: {}", rateLimitInfo);
+        }
 
         int totalProcessed = 0;
         int totalSkipped = 0;
         int failedRepositories = 0;
 
+        // MVP 저장소 목록 가져오기
         List<RepositoryTarget> mvpRepositories = mvpRepositoryConfig.getMVPRepositories();
         log.info("수집 대상 저장소 수: {}개", mvpRepositories.size());
 
@@ -78,21 +84,12 @@ public class GitHubSyncService {
                 log.info("저장소 수집 시작: {} (언어: {}, 라벨: {})",
                         target.getFullName(), target.getLanguage(), target.getLabels());
 
-                GitHubSearchResponse response = githubDirectApiService.searchRepositoryIssues(
-                    target.getFullName(),
-                    target.getLabels()
-                );
+                // 다중 페이지 처리로 더 많은 이슈 수집
+                ProcessingResult repositoryResult = collectAllIssuesFromRepository(target);
+                totalProcessed += repositoryResult.getProcessedCount();
+                totalSkipped += repositoryResult.getSkippedCount();
 
-                if (response != null && response.getItems() != null) {
-                    int[] results = processMVPGitHubResponse(response, target);
-                    totalProcessed += results[0];
-                    totalSkipped += results[1];
-
-                    log.info("저장소 수집 완료: {} - 신규: {}개, 중복: {}개",
-                            target.getFullName(), results[0], results[1]);
-                } else {
-                    log.warn("저장소 응답 데이터 없음: {}", target.getFullName());
-                }
+                log.info("저장소 수집 완료: {} - {}", target.getFullName(), repositoryResult.getSummary());
 
             } catch (Exception e) {
                 failedRepositories++;
@@ -103,50 +100,106 @@ public class GitHubSyncService {
         log.info("=== MVP 동기화 완료: 총 신규 {}개, 중복 {}개, 실패 {}개 저장소 ===",
                 totalProcessed, totalSkipped, failedRepositories);
     }
-
+    
     /**
-     * 레거시 GitHub 이슈 동기화 (기존 방식 유지)
-     *
-     * 기존 시스템과의 호환성을 위해 유지되는 메서드입니다.
-     * MVP 이후에는 제거될 예정입니다.
+     * 저장소에서 모든 오픈 이슈를 수집합니다.
+     * 
+     * @param target 대상 저장소
+     * @return 처리 결과
      */
-//    @Scheduled(fixedDelay = 3600000) // 1시간마다 실행
-//    public void syncLegacyGitHubIssues() {
-//        log.info("=== 레거시 GitHub 이슈 동기화 시작 ===");
-//
-//        try {
-//            // 동기 방식으로 처리 (block() 사용)
-//            GitHubSearchResponse response = githubIssueService
-//                    .searchBeginnerIssues("java", 100, null, 1, 50)
-//                    .block(); // 동기 처리
-//
-//            if (response != null) {
-//                log.info("레거시 API 응답 수신: {}개 이슈", response.getItems().size());
-//                processGitHubResponse(response);
-//            }
-//        } catch (Exception e) {
-//            log.error("레거시 GitHub API 호출 실패", e);
-//        }
-//    }
+    private ProcessingResult collectAllIssuesFromRepository(RepositoryTarget target) {
+        int totalProcessed = 0;
+        int totalSkipped = 0;
+        int currentPage = 1;
+        boolean hasMorePages = true;
+        
+        log.info("다중 페이지 이슈 수집 시작: {} (최대 {}P 처리)", 
+                target.getFullName(), MAX_PAGES_PER_REPO);
+        
+        while (hasMorePages && currentPage <= MAX_PAGES_PER_REPO) {
+            try {
+                log.debug("페이지 {} 처리 시작: {}", currentPage, target.getFullName());
+                
+                // API 호출
+                GitHubSearchResponse response = githubDirectApiService.searchRepositoryIssuesWithPagination(
+                        target.getFullName(),
+                        target.getLabels(),
+                        currentPage,
+                        ISSUES_PER_PAGE
+                );
+                
+                // Rate Limit 방지 대기
+                try {
+                    Thread.sleep(RATE_LIMIT_DELAY.toMillis());
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    log.warn("요청 간격 대기 중 인터럽트 발생");
+                    break;
+                }
+                
+                if (response != null && response.getItems() != null && !response.getItems().isEmpty()) {
+                    ProcessingResult pageResult = processMVPGitHubResponse(response, target);
+                    totalProcessed += pageResult.getProcessedCount();
+                    totalSkipped += pageResult.getSkippedCount();
+                    
+                    log.info("페이지 {} 처리 완료: {} - 수집 {}+{}개, {}", 
+                            currentPage, target.getFullName(), 
+                            pageResult.getProcessedCount(), pageResult.getSkippedCount(),
+                            response.getItems().size() < ISSUES_PER_PAGE ? "마지막 페이지" : "계속");
+                    
+                    // 마지막 페이지 확인
+                    if (response.getItems().size() < ISSUES_PER_PAGE) {
+                        hasMorePages = false;
+                        log.debug("마지막 페이지 도달: {} ({}< {})", 
+                                target.getFullName(), response.getItems().size(), ISSUES_PER_PAGE);
+                    }
+                } else {
+                    log.warn("페이지 {} 데이터 없음: {} - Rate Limit 또는 API 오류", 
+                            currentPage, target.getFullName());
+                    
+                    // Rate Limit 발생 시 더 긴 대기
+                    try {
+                        log.info("Rate Limit 복구를 위해 {}초 추가 대기", RETRY_DELAY_AFTER_RATE_LIMIT.getSeconds());
+                        Thread.sleep(RETRY_DELAY_AFTER_RATE_LIMIT.toMillis());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        log.warn("Rate Limit 대기 중 인터럽트 발생");
+                    }
+                    hasMorePages = false;
+                }
+                
+                currentPage++;
+                
+            } catch (Exception e) {
+                log.error("페이지 {} 처리 실패: {} - {}", 
+                        currentPage, target.getFullName(), e.getMessage(), e);
+                hasMorePages = false;
+            }
+        }
+        
+        ProcessingResult finalResult = new ProcessingResult(totalProcessed, totalSkipped);
+        log.info("다중 페이지 수집 완료: {} - 총 {}P 처리, {}", 
+                target.getFullName(), currentPage - 1, finalResult.getSummary());
+        
+        return finalResult;
+    }
+
 
     /**
-     * MVP GitHub 응답 처리
-     *
-     * RestTemplate 기반으로 수집된 이슈 데이터를 처리합니다.
-     * 레포지토리별 맞춤 라벨과 메타데이터를 활용하여 더 정확한 데이터를 저장합니다.
-     *
-     * @param response GitHub API 검색 응답
-     * @param target 수집 대상 저장소 정보 (라벨, 언어 등 메타데이터 포함)
-     * @return int[] {처리된 이슈 수, 중복 이슈 수}
+     * GitHub API 응답을 처리하여 이슈를 데이터베이스에 저장합니다.
+     * 
+     * @param response 검색 응답
+     * @param target 대상 저장소
+     * @return 처리 결과
      */
     @Transactional
-    protected int[] processMVPGitHubResponse(GitHubSearchResponse response, RepositoryTarget target) {
+    protected ProcessingResult processMVPGitHubResponse(GitHubSearchResponse response, RepositoryTarget target) {
         int processedCount = 0;
         int skippedCount = 0;
 
         if (response.getItems() == null || response.getItems().isEmpty()) {
             log.info("수집된 이슈가 없습니다 - Repository: {}", target.getFullName());
-            return new int[]{0, 0};
+            return new ProcessingResult(0, 0);
         }
 
         log.info("MVP 이슈 처리 시작 - Repository: {}, 이슈 수: {}개",
@@ -167,70 +220,30 @@ public class GitHubSyncService {
             }
         }
 
-        log.info("MVP 이슈 처리 완료 - Repository: {}, 신규: {}개, 중복: {}개",
-                target.getFullName(), processedCount, skippedCount);
-        return new int[]{processedCount, skippedCount};
+        ProcessingResult result = new ProcessingResult(processedCount, skippedCount);
+        log.info("MVP 이슈 처리 완료 - Repository: {}, {}", target.getFullName(), result.getSummary());
+        return result;
     }
 
     /**
-     * 레거시 GitHub 응답 처리 (기존 방식)
-     *
-     * 기존 WebClient 기반으로 수집된 데이터를 처리하는 메서드입니다.
-     * MVP 이후 단계적으로 제거될 예정입니다.
-     */
-    @Transactional
-    protected void processGitHubResponse(GitHubSearchResponse response) {
-        int processedCount = 0;
-        int skippedCount = 0;
-
-        for (GitHubIssue gitHubIssue : response.getItems()) {
-            try {
-                if (processIssue(gitHubIssue)) {
-                    processedCount++;
-                    log.debug("처리 완료: {} - {}",
-                            gitHubIssue.getRepository().getFullName(),
-                            gitHubIssue.getTitle());
-                } else {
-                    skippedCount++;
-                }
-            } catch (Exception e) {
-                log.error("이슈 처리 실패 - ID: {}, Repo: {}",
-                        gitHubIssue.getId(),
-                        gitHubIssue.getRepository().getFullName(), e);
-            }
-        }
-
-        log.info("=== 동기화 완료: 신규 {}개, 중복 {}개 ===", processedCount, skippedCount);
-    }
-
-    /**
-     * MVP 개별 이슈 처리
-     *
-     * RepositoryTarget의 메타데이터를 활용하여 더 정확한 이슈 분류를 수행합니다.
-     * 레포지토리별 맞춤 라벨 정보를 기반으로 난이도와 예상 시간을 계산합니다.
-     *
-     * @param dto GitHub 이슈 데이터
-     * @param target 수집 대상 저장소 정보 (언어, 라벨 등)
-     * @return 처리 성공 여부 (true: 신규 저장, false: 중복 또는 실패)
+     * GitHub 이슈를 처리하여 데이터베이스에 저장합니다.
+     * 
+     * @param dto 이슈 데이터
+     * @param target 대상 저장소
+     * @return 처리 성공 여부
      */
     private boolean processMVPIssue(GitHubIssue dto, RepositoryTarget target) {
         // 필수 데이터 검증
-        if (dto.getRepository() == null || dto.getId() == null) {
-            log.warn("MVP 이슈 필수 데이터 누락: Issue ID={}, Repository={}",
-                    dto.getId(), target.getFullName());
+        if (dto.getId() == null || dto.getTitle() == null) {
+            log.warn("MVP 이슈 필수 데이터 누락: Issue ID={}, Title={}, Target={}",
+                    dto.getId(), dto.getTitle(), target.getFullName());
             return false;
         }
 
-        // 1. Repository 처리 (UPSERT) - MVP 정보 활용
+        // 1. Repository 처리 (UPSERT) - GitHub Search API에서는 repository 객체가 없으므로 target 정보 사용
         Repository repository = repositoryRepository
-                .findByGithubRepoId(dto.getRepository().getId())
-                .orElseGet(() -> createMVPRepository(dto.getRepository(), target));
-
-        // 스타 수 업데이트
-        if (dto.getRepository().getStargazersCount() != null) {
-            repository.setStarsCount(dto.getRepository().getStargazersCount());
-            repository = repositoryRepository.save(repository);
-        }
+                .findByOwnerAndName(target.getOwner(), target.getName())
+                .orElseGet(() -> createMVPRepositoryFromTarget(target));
 
         // 2. 중복 체크
         if (issueRepository.existsByGithubIssueId(dto.getId())) {
@@ -238,7 +251,7 @@ public class GitHubSyncService {
             return false;
         }
 
-        // 3. MVP Issue 생성 - 타겟 정보 활용
+        // 3. Issue 생성 - 타겟 정보 활용
         Issue issue = Issue.builder()
                 .githubIssueId(dto.getId())
                 .repository(repository)
@@ -250,10 +263,10 @@ public class GitHubSyncService {
                 .popularityScore(calculatePopularity(dto.getComments()))
                 .build();
 
-        // 4. MVP Labels 추가 - 필터링된 라벨만
+        // 4. Labels 추가 - 필터링된 라벨만
         if (dto.getLabels() != null && !dto.getLabels().isEmpty()) {
             for (GitHubLabel labelDto : dto.getLabels()) {
-                // MVP 타겟 라벨에 포함된 것만 저장
+                //  타겟 라벨에 포함된 것만 저장
                 if (isTargetLabel(labelDto.getName(), target.getLabels())) {
                     Label label = Label.builder()
                             .labelName(labelDto.getName())
@@ -265,328 +278,328 @@ public class GitHubSyncService {
         }
 
         issueRepository.save(issue);
-        log.debug("MVP 이슈 저장 완료: {} - {}", target.getFullName(), dto.getTitle());
+        log.debug(" 이슈 저장 완료: {} - {}", target.getFullName(), dto.getTitle());
         return true;
     }
 
     /**
-     * 레거시 개별 이슈 처리 (기존 방식)
-     *
-     * 기존 로직을 유지하여 호환성을 보장합니다.
-     * MVP 이후 단계적으로 제거될 예정입니다.
-     */
-    private boolean processIssue(GitHubIssue dto) {
-        // 필수 데이터 검증
-        if (dto.getRepository() == null || dto.getId() == null) {
-            log.warn("필수 데이터 누락: Issue ID={}", dto.getId());
-            return false;
-        }
-
-        // 1. Repository 처리 (UPSERT)
-        Repository repository = repositoryRepository
-                .findByGithubRepoId(dto.getRepository().getId())
-                .orElseGet(() -> createRepository(dto.getRepository()));
-
-        // 스타 수 업데이트
-        if (dto.getRepository().getStargazersCount() != null) {
-            repository.setStarsCount(dto.getRepository().getStargazersCount());
-            repository = repositoryRepository.save(repository);
-        }
-
-        // 2. 중복 체크
-        if (issueRepository.existsByGithubIssueId(dto.getId())) {
-            log.trace("이미 존재하는 이슈: {}", dto.getId());
-            return false;
-        }
-
-        // 3. Issue 생성 (githubIssueId 필드 추가!)
-        Issue issue = Issue.builder()
-                .githubIssueId(dto.getId())  // ★ 중요: GitHub Issue ID 설정
-                .repository(repository)
-                .title(dto.getTitle() != null ? dto.getTitle() : "제목 없음")
-                .githubUrl(dto.getHtmlUrl())
-                .createdAt(dto.getCreatedAt())
-                .difficultyLevel(calculateDifficulty(dto.getLabels()))
-                .estimatedTime(estimateTime(dto.getLabels()))
-                .popularityScore(calculatePopularity(dto.getComments()))
-                .build();
-
-        // 4. Labels 추가
-        if (dto.getLabels() != null && !dto.getLabels().isEmpty()) {
-            for (GitHubLabel labelDto : dto.getLabels()) {
-                Label label = Label.builder()
-                        .labelName(labelDto.getName())
-                        .labelColor("#" + labelDto.getColor())
-                        .build();
-                issue.addLabel(label);
-            }
-        }
-
-        issueRepository.save(issue);
-        return true;
-    }
-
-    /**
-     * Repository 엔티티 생성
-     */
-    private Repository createRepository(org.example.opensource_rest_api.dto.GitHubRepository dto) {
-        String fullName = dto.getFullName() != null ? dto.getFullName() : "";
-        String[] parts = fullName.split("/");
-        String owner = parts.length > 0 ? parts[0] : "unknown";
-        String name = parts.length > 1 ? parts[1] : dto.getName();
-
-        Repository repository = Repository.builder()
-                .githubRepoId(dto.getId())
-                .owner(owner)  // ★ 중요: owner 필드 추가
-                .name(name != null ? name : "unknown")
-                .githubUrl(dto.getHtmlUrl() != null ? dto.getHtmlUrl() : "")
-                .primaryLanguage(dto.getLanguage())
-                .starsCount(dto.getStargazersCount() != null ? dto.getStargazersCount() : 0)
-                .build();
-
-        repository = repositoryRepository.save(repository);
-        log.info("새 저장소 등록: {} (스타: {})", fullName, repository.getStarsCount());
-        return repository;
-    }
-
-    /**
-     * 난이도 계산 로직
-     */
-    private String calculateDifficulty(List<GitHubLabel> labels) {
-        if (labels == null || labels.isEmpty()) {
-            return "중급";
-        }
-
-        int score = 0;
-
-        for (GitHubLabel label : labels) {
-            String labelName = label.getName().toLowerCase();
-
-            // 난이도 점수 계산
-            if (labelName.contains("good first issue") ||
-                    labelName.contains("beginner") ||
-                    labelName.contains("easy")) {
-                score -= 50;
-            } else if (labelName.contains("documentation") ||
-                    labelName.contains("docs")) {
-                score -= 30;
-            } else if (labelName.contains("bug")) {
-                score += 20;
-            } else if (labelName.contains("performance") ||
-                    labelName.contains("optimization")) {
-                score += 40;
-            } else if (labelName.contains("refactor") ||
-                    labelName.contains("enhancement")) {
-                score += 30;
-            }
-        }
-
-        // 점수를 난이도로 변환
-        if (score < 0) return "초급";
-        else if (score < 40) return "중급";
-        else return "고급";
-    }
-
-    /**
-     * 예상 시간 계산 로직
-     */
-    private String estimateTime(List<GitHubLabel> labels) {
-        if (labels == null || labels.isEmpty()) {
-            return "1-3시간";
-        }
-
-        for (GitHubLabel label : labels) {
-            String labelName = label.getName().toLowerCase();
-
-            // size 라벨 기반 시간 추정
-            if (labelName.contains("size/xs") || labelName.contains("tiny")) {
-                return "1시간 이내";
-            }
-            if (labelName.contains("size/s") || labelName.contains("small")) {
-                return "1-3시간";
-            }
-            if (labelName.contains("size/m") || labelName.contains("medium")) {
-                return "3-8시간";
-            }
-            if (labelName.contains("size/l") || labelName.contains("large")) {
-                return "8시간 이상";
-            }
-        }
-
-        // good first issue는 보통 짧은 시간
-        for (GitHubLabel label : labels) {
-            if (label.getName().toLowerCase().contains("good first issue")) {
-                return "1-3시간";
-            }
-        }
-
-        return "3-8시간"; // 기본값
-    }
-
-    /**
-     * 인기도 점수 계산
+     * 이슈의 인기도 점수를 계산합니다.
+     * 
+     * @param comments 댓글 수
+     * @return 0-100 사이의 인기도 점수
      */
     private Integer calculatePopularity(Integer comments) {
-        // 댓글 수에 가중치 적용
-        return comments != null ? comments * 2 : 0;
+        if (comments == null || comments <= 0) {
+            return 0;
+        }
+        
+        // 1. 댓글 수 기반 점수 (로그 스케일 적용) - 참고용으로 보관
+        // 실제 계산은 구간별 보정 사용
+        
+        // 2. 댓글 수별 구간 보정
+        int baseScore;
+        if (comments <= 5) {
+            baseScore = comments * 8;  // 1-5개: 8~40점
+        } else if (comments <= 15) {
+            baseScore = 40 + (comments - 5) * 4;  // 6-15개: 44~80점
+        } else if (comments <= 30) {
+            baseScore = 80 + (comments - 15) * 2;  // 16-30개: 82~110점
+        } else {
+            // 30개 이상은 급격한 증가 억제
+            baseScore = 110 + (int) Math.log(comments - 29) * 10;
+        }
+        
+        // 3. 최종 점수 계산 및 상한선 적용
+        int finalScore = Math.min(baseScore, MAX_POPULARITY_SCORE);  // 최대 점수 제한
+        
+        return Math.max(finalScore, MIN_POPULARITY_SCORE);  // 최소 점수 제한
     }
 
     /**
-     * MVP용 Repository 엔티티 생성
-     *
-     * RepositoryTarget의 메타데이터를 활용하여 더 정확한 저장소 정보를 생성합니다.
-     * 기본 언어 정보가 누락된 경우 타겟 설정의 언어를 사용합니다.
-     *
-     * @param dto GitHub 저장소 데이터
-     * @param target MVP 저장소 타겟 정보
-     * @return 생성된 Repository 엔티티
+     * Repository 엔티티를 생성합니다.
+     * 
+     * @param target 대상 저장소 정보
+     * @return 생성된 Repository
      */
-    private Repository createMVPRepository(org.example.opensource_rest_api.dto.GitHubRepository dto,
-                                         RepositoryTarget target) {
-        String fullName = dto.getFullName() != null ? dto.getFullName() : target.getFullName();
-        String[] parts = fullName.split("/");
-        String owner = parts.length > 0 ? parts[0] : "unknown";
-        String name = parts.length > 1 ? parts[1] : dto.getName();
+    private Repository createMVPRepositoryFromTarget(RepositoryTarget target) {
+        try {
+            // GitHub Repository API 호출하여 실제 정보 가져오기
+            GitHubRepository repoInfo = githubDirectApiService.getRepositoryInfo(target.getFullName());
+            
+            if (repoInfo == null || repoInfo.getId() == null) {
+                throw new IllegalStateException("GitHub API가 유효하지 않은 저장소 정보를 반환했습니다: " + target.getFullName());
+            }
 
-        // MVP: 타겟 언어 정보를 우선 사용
-        String primaryLanguage = dto.getLanguage() != null ? dto.getLanguage() : target.getLanguage();
+            Repository repository = Repository.builder()
+                    .githubRepoId(repoInfo.getId())
+                    .owner(target.getOwner())
+                    .name(target.getName())
+                    .githubUrl(repoInfo.getHtmlUrl() != null ? repoInfo.getHtmlUrl() : "https://github.com/" + target.getFullName())
+                    .primaryLanguage(repoInfo.getLanguage() != null ? repoInfo.getLanguage() : target.getLanguage())
+                    .starsCount(repoInfo.getStargazersCount() != null ? repoInfo.getStargazersCount() : 0)
+                    .build();
 
-        Repository repository = Repository.builder()
-                .githubRepoId(dto.getId())
-                .owner(owner)
-                .name(name != null ? name : "unknown")
-                .githubUrl(dto.getHtmlUrl() != null ? dto.getHtmlUrl() : "")
-                .primaryLanguage(primaryLanguage)  // MVP 개선: 타겟 정보 활용
-                .starsCount(dto.getStargazersCount() != null ? dto.getStargazersCount() : 0)
-                .build();
+            repository = repositoryRepository.save(repository);
+            log.info("MVP 새 저장소 등록 (GitHub API 기반): {} (ID: {}, 언어: {}, 스타: {})",
+                    target.getFullName(), repoInfo.getId(), repository.getPrimaryLanguage(), repository.getStarsCount());
+            return repository;
 
-        repository = repositoryRepository.save(repository);
-        log.info("MVP 새 저장소 등록: {} (언어: {}, 스타: {})",
-                fullName, primaryLanguage, repository.getStarsCount());
-        return repository;
+        } catch (Exception e) {
+            // API 실패는 심각한 문제 - 데이터 무결성을 위해 예외를 전파
+            log.error("GitHub Repository API 호출 실패 - 저장소 생성 중단: {} - 원인: {}", 
+                     target.getFullName(), e.getMessage(), e);
+            
+            // 임시 ID 사용 대신 예외를 던져 상위에서 처리하도록 함
+            throw new RuntimeException(
+                String.format("저장소 정보를 가져올 수 없습니다: %s (원인: %s)", 
+                             target.getFullName(), e.getMessage()), e);
+        }
     }
 
     /**
-     * MVP용 난이도 계산 로직
-     *
-     * RepositoryTarget의 실제 라벨 정보를 기반으로 더 정확한 난이도를 계산합니다.
-     * 저장소별 고유 라벨 체계를 반영하여 개선된 분류 정확도를 제공합니다.
-     *
-     * @param labels 이슈의 라벨 목록
-     * @param target 저장소 타겟 정보 (맞춤 라벨 포함)
-     * @return 계산된 난이도 ("초급", "중급", "고급")
+     * 이슈의 난이도를 계산합니다.
+     * 
+     * @param labels 이슈 라벨 목록
+     * @param target 대상 저장소
+     * @return 난이도 ("초급", "중급", "고급")
      */
     private String calculateMVPDifficulty(List<GitHubLabel> labels, RepositoryTarget target) {
         if (labels == null || labels.isEmpty()) {
-            return "중급";  // 기본값
+            return DIFFICULTY_INTERMEDIATE;  // 기본값
         }
 
+        int score = calculateDifficultyScore(labels, target);
+        return convertScoreToDifficulty(score);
+    }
+    
+    // 라벨 기반 난이도 점수 계산
+    private int calculateDifficultyScore(List<GitHubLabel> labels, RepositoryTarget target) {
         int score = 0;
-
+        Map<String, Integer> repoCustomWeights = getRepositoryCustomWeights(target);
+        
         for (GitHubLabel label : labels) {
             String labelName = label.getName().toLowerCase();
-
-            // 기본 초보자 라벨
-            if (labelName.contains("good first issue") ||
-                labelName.contains("beginner") ||
-                labelName.contains("easy")) {
-                score -= 50;
+            
+            // 타겟 라벨 확인
+            if (!isValidTargetLabel(labelName, target)) {
+                continue;
             }
-
-            // MVP: 저장소별 맞춤 초보자 라벨 (Spring Boot 예시)
-            else if (labelName.contains("waiting-for-triage")) {
-                score -= 30;  // 검토 대기 중인 이슈는 비교적 쉬움
-            }
-
-            // MVP: 저장소별 맞춤 라벨 (Vue, Next.js 등)
-            else if (labelName.contains("contribution welcome") ||
-                     labelName.contains("documentation")) {
-                score -= 30;  // 기여 환영, 문서 작업은 접근하기 쉬움
-            }
-
-            // 난이도 증가 라벨들
-            else if (labelName.contains("bug")) {
-                score += 20;
-            }
-            else if (labelName.contains("performance") ||
-                     labelName.contains("optimization")) {
-                score += 40;
-            }
-            else if (labelName.contains("refactor") ||
-                     labelName.contains("enhancement")) {
-                score += 30;
-            }
-
-            // MVP: 컴포넌트 관련 (React 등)
-            else if (labelName.contains("component:")) {
-                score += 10;  // 컴포넌트 작업은 약간 복잡
+            
+            // 가중치 적용
+            int weight = calculateLabelWeight(labelName, repoCustomWeights);
+            score += weight;
+        }
+        
+        return score;
+    }
+    
+    // 저장소별 커스텀 가중치 조회
+    private Map<String, Integer> getRepositoryCustomWeights(RepositoryTarget target) {
+        if (target == null || target.getFullName() == null) {
+            return Map.of();  // 빈 맵 반환 (null 대신)
+        }
+        
+        Map<String, Map<String, Integer>> customWeights = difficultyConfig.getRepositoryCustomWeights();
+        Map<String, Integer> result = customWeights.get(target.getFullName());
+        return result != null ? result : Map.of();  // null 대신 빈 맵 반환
+    }
+    
+    // 라벨 유효성 검사
+    private boolean isValidTargetLabel(String labelName, RepositoryTarget target) {
+        if (target == null || target.getLabels() == null) {
+            return true;  // 타겟 라벨 제한이 없으면 모든 라벨 허용
+        }
+        
+        boolean isValid = target.getLabels().stream()
+                .anyMatch(targetLabel -> targetLabel.toLowerCase().equals(labelName));
+        
+        if (!isValid) {
+            log.trace("라벨 '{}'는 {} 저장소의 타겟 라벨이 아님, 건너뜀",
+                    labelName, target.getFullName());
+        }
+        
+        return isValid;
+    }
+    
+    // 라벨별 가중치 계산
+    private int calculateLabelWeight(String labelName, Map<String, Integer> repoCustomWeights) {
+        // 1. 저장소별 커스텀 가중치 우선 적용
+        if (repoCustomWeights != null) {
+            for (Map.Entry<String, Integer> entry : repoCustomWeights.entrySet()) {
+                if (labelName.contains(entry.getKey().toLowerCase())) {
+                    log.trace("저장소 커스텀 가중치 적용: {} -> {}", labelName, entry.getValue());
+                    return entry.getValue();
+                }
             }
         }
-
-        // 점수를 난이도로 변환
-        if (score < -20) return "초급";      // MVP: 임계값 조정
-        else if (score < 20) return "중급";
-        else return "고급";
+        
+        // 2. 전역 가중치 적용
+        Map<String, Integer> labelWeights = difficultyConfig.getLabelWeights();
+        for (Map.Entry<String, Integer> entry : labelWeights.entrySet()) {
+            if (labelName.contains(entry.getKey().toLowerCase())) {
+                log.trace("전역 가중치 적용: {} -> {}", labelName, entry.getValue());
+                return entry.getValue();
+            }
+        }
+        
+        return 0;  // 매칭되는 가중치가 없으면 0점
+    }
+    
+    // 점수를 난이도로 변환
+    private String convertScoreToDifficulty(int score) {
+        DifficultyConfig.DifficultyThresholds thresholds = difficultyConfig.getThresholds();
+        String difficulty;
+        
+        if (score < thresholds.getBeginner()) {
+            difficulty = DIFFICULTY_BEGINNER;
+        } else if (score < thresholds.getIntermediate()) {
+            difficulty = DIFFICULTY_INTERMEDIATE;
+        } else {
+            difficulty = DIFFICULTY_ADVANCED;
+        }
+        
+        log.debug("난이도 계산 완료: score={} -> {}", score, difficulty);
+        return difficulty;
     }
 
+    // 시간 추정 상수 정의
+    private static final String TIME_UNDER_1H = "1시간 이내";
+    private static final String TIME_1_TO_3H = "1-3시간";
+    private static final String TIME_3_TO_8H = "3-8시간";
+    private static final String TIME_OVER_8H = "8시간 이상";
+    
     /**
-     * MVP용 예상 시간 계산 로직
-     *
-     * 저장소별 라벨 특성을 반영하여 더 정확한 시간 추정을 제공합니다.
-     *
-     * @param labels 이슈의 라벨 목록
-     * @param target 저장소 타겟 정보
-     * @return 계산된 예상 시간
+     * 이슈의 예상 작업 시간을 계산합니다.
+     * 
+     * @param labels 이슈 라벨 목록
+     * @param target 대상 저장소
+     * @return 예상 시간
      */
     private String calculateMVPEstimatedTime(List<GitHubLabel> labels, RepositoryTarget target) {
         if (labels == null || labels.isEmpty()) {
-            return "1-3시간";  // 기본값
+            return TIME_1_TO_3H;  // 기본값
         }
 
+        // 1순위: 명시적 size 라벨 확인 (즉시 반환)
+        String explicitSize = checkForExplicitSizeLabels(labels);
+        if (explicitSize != null) {
+            return explicitSize;
+        }
+        
+        // 2순위: 작업 유형과 특성을 종합적으로 고려
+        int timeScore = calculateTimeScore(labels, target);
+        return convertScoreToTime(timeScore, hasGoodFirstIssue(labels));
+    }
+    
+    // size 라벨 확인
+    private String checkForExplicitSizeLabels(List<GitHubLabel> labels) {
         for (GitHubLabel label : labels) {
             String labelName = label.getName().toLowerCase();
-
-            // 표준 size 라벨
+            
             if (labelName.contains("size/xs") || labelName.contains("tiny")) {
-                return "1시간 이내";
+                return TIME_UNDER_1H;
             }
             if (labelName.contains("size/s") || labelName.contains("small")) {
-                return "1-3시간";
+                return TIME_1_TO_3H;
             }
             if (labelName.contains("size/m") || labelName.contains("medium")) {
-                return "3-8시간";
+                return TIME_3_TO_8H;
             }
-            if (labelName.contains("size/l") || labelName.contains("large")) {
-                return "8시간 이상";
-            }
-
-            // MVP: 저장소별 특성 반영
-            if (labelName.contains("documentation") || labelName.contains("type: documentation")) {
-                return "1-3시간";  // 문서 작업은 비교적 빠름
-            }
-            if (labelName.contains("waiting-for-triage")) {
-                return "1-3시간";  // 트리아지 대기는 보통 간단함
+            if (labelName.contains("size/l") || labelName.contains("large") || 
+                labelName.contains("size/xl") || labelName.contains("huge")) {
+                return TIME_OVER_8H;
             }
         }
-
-        // good first issue는 보통 짧은 시간
+        return null;  // 명시적 크기 라벨 없음
+    }
+    
+    // 작업 유형별 시간 점수 계산
+    private int calculateTimeScore(List<GitHubLabel> labels, RepositoryTarget target) {
+        int timeScore = 0;
+        
+        // 작업 유형별 점수 누적
         for (GitHubLabel label : labels) {
-            if (label.getName().toLowerCase().contains("good first issue")) {
-                return "1-3시간";
+            String labelName = label.getName().toLowerCase();
+            
+            if (labelName.contains("documentation") || labelName.contains("docs")) {
+                timeScore -= 20;  // 문서 작업은 보통 빠름
+            }
+            else if (labelName.contains("bug") || labelName.contains("fix")) {
+                timeScore += 10;  // 버그 수정은 중간
+            }
+            else if (labelName.contains("feature") || labelName.contains("enhancement")) {
+                timeScore += 20;  // 기능 추가는 시간 소요
+            }
+            else if (labelName.contains("refactor") || labelName.contains("performance")) {
+                timeScore += 30;  // 리팩토링/성능 개선은 오래 걸림
+            }
+            else if (labelName.contains("test") || labelName.contains("testing")) {
+                timeScore += 15;  // 테스트 작성
+            }
+            
+            // good first issue 보정
+            if (labelName.contains("good first issue") || labelName.contains("beginner")) {
+                timeScore -= 15;
             }
         }
-
-        return "3-8시간"; // 기본값
+        
+        // 저장소별 특성 반영
+        timeScore += calculateRepositoryComplexityBonus(target);
+        
+        return timeScore;
+    }
+    
+    // good first issue 라벨 확인
+    private boolean hasGoodFirstIssue(List<GitHubLabel> labels) {
+        return labels.stream()
+                .anyMatch(label -> {
+                    String labelName = label.getName().toLowerCase();
+                    return labelName.contains("good first issue") || labelName.contains("beginner");
+                });
+    }
+    
+    // 저장소 복잡도 보너스 계산
+    private int calculateRepositoryComplexityBonus(RepositoryTarget target) {
+        if (target == null) {
+            return 0;
+        }
+        
+        int complexityBonus = 0;
+        
+        // 언어별 특성
+        if (target.getLanguage() != null && 
+            (target.getLanguage().equalsIgnoreCase("javascript") || 
+             target.getLanguage().equalsIgnoreCase("typescript"))) {
+            complexityBonus += 5;  // 프론트엔드는 UI 작업이 많음
+        }
+        
+        // 프로젝트 규모별 특성
+        if (target.getFullName() != null && 
+            (target.getFullName().contains("spring") || target.getFullName().contains("elastic"))) {
+            complexityBonus += 10;  // 대형 프로젝트는 진입 장벽 높음
+        }
+        
+        return complexityBonus;
+    }
+    
+    // 점수를 예상 시간으로 변환
+    private String convertScoreToTime(int timeScore, boolean hasGoodFirstIssue) {
+        // 초보자 이슈는 보수적으로 추정
+        if (hasGoodFirstIssue && timeScore < 10) {
+            return TIME_1_TO_3H;
+        }
+        
+        if (timeScore < -10) return TIME_UNDER_1H;
+        else if (timeScore < 15) return TIME_1_TO_3H;
+        else if (timeScore < 30) return TIME_3_TO_8H;
+        else return TIME_OVER_8H;
     }
 
     /**
-     * 타겟 라벨 포함 여부 확인
-     *
-     * 이슈의 라벨이 MVP 수집 대상 라벨에 포함되는지 확인합니다.
-     * 대소문자를 구분하지 않고 부분 매칭을 지원합니다.
-     *
-     * @param labelName 확인할 라벨 이름
-     * @param targetLabels 타겟 저장소의 수집 대상 라벨 목록
+     * 라벨이 수집 대상에 포함되는지 확인합니다.
+     * 
+     * @param labelName 라벨명
+     * @param targetLabels 대상 라벨 목록
      * @return 포함 여부
      */
     private boolean isTargetLabel(String labelName, List<String> targetLabels) {
@@ -597,17 +610,6 @@ public class GitHubSyncService {
         String lowerLabelName = labelName.toLowerCase();
         return targetLabels.stream()
                 .anyMatch(target -> lowerLabelName.contains(target.toLowerCase()) ||
-                                   target.toLowerCase().contains(lowerLabelName));
+                        target.toLowerCase().contains(lowerLabelName));
     }
-
-    /**
-     * MVP 수동 동기화 트리거 (테스트용)
-     *
-     * 개발 및 테스트 목적으로 MVP 동기화를 수동 실행합니다.
-     */
-    public void syncMVPNow() {
-        log.info("MVP 수동 동기화 시작");
-        syncMVPGitHubIssues();
-    }
-
 }

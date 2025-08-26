@@ -20,48 +20,48 @@ public class MVPRepositoryConfig {
      * 선정 기준:
      * - 높은 스타 수 (20k+ stars)
      * - 활발한 커뮤니티와 정기적인 이슈 생성
-     * - "good first issue" 라벨 활용
+     * - 초보자도 접근 가능한 다양한 라벨 포함
      * - 백엔드(2개) + 프론트엔드(3개) 기술 다양성
      * 
-     * 실제 저장소 검증 완료:
-     * - Spring Boot: "status: ideal-for-contribution" (실제 존재)
-     * - React: "Component: Developer Tools" (실제 존재)
-     * - Vue: "contribution welcome" (실제 존재)
-     * - Next.js: "Documentation" (실제 존재)
-     * - Elasticsearch: "help wanted" (실제 존재)
+     * 실제 저장소 라벨 조사 결과 반영:
+     * - Spring Boot: waiting-for-triage, type: documentation, type: enhancement 주로 사용
+     * - Elasticsearch: Team 라벨과 >test-failure 주로 사용 -> 더 포괄적 접근 필요
+     * - React: Component, Status, Type 라벨 체계 사용
+     * - Vue.js: 라벨 사용 빈도가 낮음 -> 라벨 없이도 수집
+     * - Next.js: 기능별 라벨 (TypeScript, Turbopack 등) 사용
      */
     public static final List<RepositoryTarget> MVP_REPOSITORIES = List.of(
         
-        // 백엔드 레포지토리
+        // 백엔드 레포지토리 - 더 포괄적인 라벨 사용
         new RepositoryTarget(
             "spring-projects/spring-boot", 
             "java",
-            List.of("good first issue", "status: ideal-for-contribution")
+            List.of("type: documentation", "type: enhancement", "status: waiting-for-triage")
         ),
         
         new RepositoryTarget(
             "elastic/elasticsearch", 
             "java",
-            List.of("good first issue", "help wanted")
+            List.of(">test-failure", "Team:Core", ":Delivery")
         ),
         
-        // 프론트엔드 레포지토리
+        // 프론트엔드 레포지토리 - 실제 사용 라벨 반영
         new RepositoryTarget(
             "facebook/react", 
             "javascript",
-            List.of("good first issue", "Component: Developer Tools")
+            List.of("Component: Developer Tools", "Status: Unconfirmed", "Type: Bug")
         ),
         
         new RepositoryTarget(
             "vuejs/vue", 
             "javascript",
-            List.of("good first issue", "contribution welcome")
+            List.of() // 라벨 사용 빈도가 낮으므로 라벨 조건 없이 수집
         ),
         
         new RepositoryTarget(
             "vercel/next.js", 
             "javascript",
-            List.of("good first issue", "Documentation")
+            List.of("TypeScript", "Documentation", "Turbopack")
         )
     );
     
