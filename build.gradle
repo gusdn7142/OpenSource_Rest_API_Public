@@ -40,6 +40,7 @@ dependencies {
     // (DB에 맞는 JDBC Driver, 예: H2, MariaDB, MySQL 등)
     runtimeOnly 'com.h2database:h2'           // 인메모리 H2 DB
     // runtimeOnly 'org.mariadb.jdbc:mariadb-java-client'   // MariaDB
+    runtimeOnly 'com.mysql:mysql-connector-j'  // MySQL
 }
 
 tasks.named('test') {
